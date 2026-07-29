@@ -1,237 +1,176 @@
-"""
-TechZIta Duplicate Inspector - Modern Streamlit Interface featuring Custom CSS, 
-Collapsible Rule Expanders, High-Speed Settings, and CSV/Excel Downloads.
-"""
-import streamlit as st
-import pandas as pd
-import plotly.express as px
 import io
+import pandas as pd
+import streamlit as st
+from engine import calculate_weighted_match_score, load_matching_rules
 
-from config import DEFAULT_FUZZY_THRESHOLD, COMPOSITE_SCORE_THRESHOLD, COLOR_CLEAN, COLOR_DUPLICATE
-from db_connector import DatabaseManager
-from engine import AdvancedDuplicateEngine
+# Page configuration
+st.set_page_config(
+    page_title="TechZita Duplicate Inspector",
+    page_icon="🔍",
+    layout="wide",
+)
 
-# Page Configuration
-st.set_page_config(page_title="TechZIta Duplicate Inspector", layout="wide", page_icon="🔎")
+# Sidebar setup
+st.sidebar.image("logo.png", width=180)
+st.sidebar.title("1. Data Ingestion")
 
-# Custom UI Styling (Modern Dark Dashboard Look)
-st.markdown("""
-    <style>
-        .main {
-            background-color: #0e1117;
-        }
-        div[data-testid="stMetric"] {
-            background-color: #1a1c24;
-            padding: 15px;
-            border-radius: 10px;
-            border: 1px solid #2d3748;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        }
-        .stTabs [data-baseweb="tab-list"] {
-            gap: 12px;
-        }
-        .stTabs [data-baseweb="tab"] {
-            background-color: #1a1c24;
-            border-radius: 8px 8px 0px 0px;
-            padding: 10px 20px;
-            color: #ffffff;
-            font-weight: 600;
-        }
-    </style>
-""", unsafe_allow_html=True)
+data_source = st.sidebar.radio(
+    "Data Source", ["CSV / Excel Upload", "SQL Database"]
+)
 
-def convert_df_to_excel(df):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Sheet1')
-    return output.getvalue()
-
-# -----------------------------------------------------------------------------
-# SIDEBAR: LOGO & DATA INGESTION
-# -----------------------------------------------------------------------------
-try:
-    st.sidebar.image("logo.png", use_container_width=True)
-except Exception:
-    pass  # Fallback if logo.png is missing
-
-st.sidebar.markdown("---")
-st.sidebar.header("📁 1. Data Ingestion")
-source_type = st.sidebar.radio("Data Source", ["CSV / Excel Upload", "SQL Database"])
-
-df = None
-active_conn_str = None
-
-if source_type == "CSV / Excel Upload":
-    file = st.sidebar.file_uploader("Upload dataset", type=["csv", "xlsx"])
-    if file:
-        try:
-            df = pd.read_csv(file) if file.name.endswith(".csv") else pd.read_excel(file)
-            st.sidebar.success(f"Successfully loaded {len(df):,} records.")
-        except Exception as err:
-            st.sidebar.error(f"Error loading file: {err}")
+uploaded_file = None
+if data_source == "CSV / Excel Upload":
+  st.sidebar.subheader("Upload dataset")
+  uploaded_file = st.sidebar.file_uploader(
+      "Upload", type=["csv", "xlsx"], label_visibility="collapsed"
+  )
+  st.sidebar.caption("200MB per file • CSV, XLSX")
 else:
-    db_engine = st.sidebar.selectbox("Engine", ["SQLite", "PostgreSQL", "MySQL"])
-    if db_engine == "SQLite":
-        db_path = st.sidebar.text_input("Database Path", "data.db")
-        active_conn_str = DatabaseManager.build_connection_string("sqlite", "", "", "", "", "", sqlite_path=db_path)
+  st.sidebar.info("SQL Database connection configured via config/secrets.")
+
+# Load Dataset First to Extract Columns for Rules Reference
+df = None
+if uploaded_file is not None:
+  try:
+    if uploaded_file.name.endswith(".csv"):
+      df = pd.read_csv(uploaded_file)
     else:
-        host = st.sidebar.text_input("Host", "localhost")
-        port = st.sidebar.text_input("Port", "5432" if db_engine == "PostgreSQL" else "3306")
-        db_name = st.sidebar.text_input("Database Name")
-        user = st.sidebar.text_input("Username")
-        pwd = st.sidebar.text_input("Password", type="password")
-        if st.sidebar.button("Connect"):
-            active_conn_str = DatabaseManager.build_connection_string(db_engine, host, port, db_name, user, pwd)
+      df = pd.read_excel(uploaded_file)
+  except Exception as e:
+    st.error(f"Error reading uploaded file: {e}")
 
-    query = st.sidebar.text_area("SQL Query", "SELECT * FROM customers LIMIT 1000")
-    if st.sidebar.button("Execute Query") and active_conn_str:
-        try:
-            df = DatabaseManager.fetch_data(active_conn_str, query)
-            st.sidebar.success(f"Fetched {len(df):,} records.")
-        except Exception as err:
-            st.sidebar.error(f"SQL Error: {err}")
+# --- 2. MATCHING RULES SECTION ---
+st.sidebar.markdown("---")
+st.sidebar.title("2. Matching Rules")
 
-# -----------------------------------------------------------------------------
-# MAIN DASHBOARD HEADER
-# -----------------------------------------------------------------------------
-st.title("🔎 TechZIta Duplicate Inspector")
-st.markdown("##### Advanced Multi-Field Duplicate Detection & Graph Clustering Engine")
-st.markdown("---")
+custom_rules = {}
 
 if df is not None:
-    # Dataset Preview Section
-    with st.expander("📋 View Dataset Preview (First 10 Rows)", expanded=False):
-        st.dataframe(df.head(10), use_container_width=True)
+  rule_input_method = st.sidebar.radio(
+      "Rule Input Method",
+      [
+          "Interactive Multi-Field Selector",
+          "Free Text Box",
+          "Upload Rules File",
+      ],
+      horizontal=False,
+  )
 
-    # Rule Configuration Section inside an Expander for a clean look
-    rules = []
-    cols = list(df.columns)
-    
-    with st.expander("⚙️ Configure Rules, Field Combinations & Manual Criteria", expanded=True):
-        custom_rules_enabled = st.checkbox("Enable Custom Field Weights & Rules", value=True)
+  all_columns = df.columns.tolist()
 
-        if custom_rules_enabled:
-            rule_count = st.number_input("Number of Rules to Define", min_value=1, max_value=10, value=min(2, len(cols)))
-            
-            for i in range(int(rule_count)):
-                st.markdown(f"**Rule #{i+1} Setup**")
-                r_mode = st.radio(f"Selection Mode #{i+1}", ["Single Column", "Combine Multiple Columns", "Manual Custom Text Input"], horizontal=True, key=f"mode_{i}")
-                
-                r1, r2, r3 = st.columns([3, 3, 2])
-                with r1:
-                    if r_mode == "Single Column":
-                        target_col = st.selectbox(f"Column #{i+1}", cols, key=f"col_{i}")
-                    elif r_mode == "Combine Multiple Columns":
-                        target_col = st.multiselect(f"Select Columns #{i+1}", cols, key=f"multi_col_{i}")
-                    else:
-                        target_col = st.text_input(f"Custom Text #{i+1}", value="", key=f"manual_text_{i}")
-                        
-                with r2:
-                    m_type = st.selectbox(f"Match Type #{i+1}", ["Fuzzy Match", "Exact Match"], key=f"type_{i}")
-                with r3:
-                    weight = st.slider(f"Weight #{i+1}", 1, 10, 5, key=f"w_{i}")
-                
-                if target_col is not None and target_col != "":
-                    rules.append({
-                        "column": target_col, 
-                        "type": m_type, 
-                        "weight": weight, 
-                        "is_manual": (r_mode == "Manual Custom Text Input")
-                    })
-                st.markdown("---")
+  if rule_input_method == "Interactive Multi-Field Selector":
+    st.sidebar.write("Select fields and assign match weights:")
+    selected_rule_columns = st.sidebar.multiselect(
+        "Choose columns for rules",
+        options=all_columns,
+        default=all_columns[:2] if len(all_columns) >= 2 else all_columns,
+    )
 
-            st.markdown("#### Overall Threshold Settings")
-            composite_threshold = st.slider("Minimum Composite Match Score (%)", 50, 100, COMPOSITE_SCORE_THRESHOLD)
+    for col in selected_rule_columns:
+      weight = st.sidebar.slider(
+          f"Weight for `{col}`",
+          min_value=0.1,
+          max_value=1.0,
+          value=1.0,
+          step=0.1,
+          key=f"weight_{col}",
+      )
+      custom_rules[col] = weight
 
-        else:
-            st.info("⚡ Default Mode: Equal weighting across selected columns.")
-            selected = st.multiselect("Columns to compare:", cols, default=cols)
-            composite_threshold = COMPOSITE_SCORE_THRESHOLD
-            for c in selected:
-                rules.append({"column": c, "type": "Exact Match", "weight": 1, "is_manual": False})
+  elif rule_input_method == "Free Text Box":
+    default_text = (
+        "# Define rules (COLUMN_NAME: weight)\nCUSTOMER: 1.0\nADDR1: 0.8"
+    )
+    rule_text_area = st.sidebar.text_area(
+        "Rules Configuration", value=default_text, height=130
+    )
 
-    # Execution Button
-    col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
-    with col_btn2:
-        run_process = st.button("🚀 Process & Cluster Duplicates", type="primary", use_container_width=True)
+    if rule_text_area:
+      for line in rule_text_area.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+          continue
+        if ":" in line:
+          col, weight = line.split(":", 1)
+          try:
+            custom_rules[col.strip()] = float(weight.strip())
+          except ValueError:
+            continue
+  else:
+    rule_file = st.sidebar.file_uploader("Upload Rules File (.txt)", type=["txt"])
+    if rule_file is not None:
+      custom_rules = load_matching_rules(rule_file)
 
-    if run_process and rules:
-        with st.spinner("Running high-speed matching engine, scoring, and clustering..."):
-            engine = AdvancedDuplicateEngine(df)
-            clean_df, duplicate_df, cluster_summary_df = engine.run_detection(rules, composite_threshold=composite_threshold)
-
-            st.markdown("---")
-            st.subheader("📊 Execution & Quality Report")
-
-            total_rec = len(df)
-            dup_rec = len(duplicate_df)
-            clean_rec = len(clean_df)
-            total_clusters = len(cluster_summary_df)
-
-            # Modern Metric Cards
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Total Records", f"{total_rec:,}")
-            k2.metric("Clean Records", f"{clean_rec:,}")
-            k3.metric("Duplicate Records", f"{dup_rec:,}")
-            k4.metric("Cluster Groups", f"{total_clusters:,}")
-
-            st.markdown("<br>", unsafe_allow_html=True)
-
-            # Visualizations
-            c1, c2 = st.columns(2)
-            with c1:
-                fig = px.pie(
-                    names=["Clean Data", "Duplicates"], 
-                    values=[clean_rec, dup_rec], 
-                    color_discrete_sequence=[COLOR_CLEAN, COLOR_DUPLICATE],
-                    title="Clean vs Duplicate Ratio"
-                )
-                fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color='white')
-                st.plotly_chart(fig, use_container_width=True)
-
-            with c2:
-                if not cluster_summary_df.empty:
-                    fig_hist = px.bar(
-                        cluster_summary_df.head(15), 
-                        x="Cluster ID", 
-                        y="Cluster Size",
-                        title="Top Duplicate Cluster Sizes",
-                        color_discrete_sequence=["#3498DB"]
-                    )
-                    fig_hist.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color='white')
-                    st.plotly_chart(fig_hist, use_container_width=True)
-
-            st.markdown("---")
-
-            # Structured Tabs for Output Data
-            t_clusters, t_dups, t_clean = st.tabs(["📌 Graph Cluster Summary", "⚠️ Flagged Duplicates", "✅ Clean Data Output"])
-
-            with t_clusters:
-                st.markdown("### Duplicate Groups (Clusters)")
-                st.dataframe(cluster_summary_df, use_container_width=True)
-
-            with t_dups:
-                st.markdown("### Identified Duplicates with Master Flags")
-                st.dataframe(duplicate_df, use_container_width=True)
-                if not duplicate_df.empty:
-                    st.markdown("**Download Reports:**")
-                    d1, d2 = st.columns(2)
-                    with d1:
-                        st.download_button("📥 Download Duplicates (CSV)", duplicate_df.to_csv(index=False), "duplicate_report.csv", "text/csv", use_container_width=True)
-                    with d2:
-                        excel_dup = convert_df_to_excel(duplicate_df)
-                        st.download_button("📥 Download Duplicates (Excel)", excel_dup, "duplicate_report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-
-            with t_clean:
-                st.markdown("### Clean Data Output")
-                st.dataframe(clean_df, use_container_width=True)
-                st.markdown("**Download Cleaned Data:**")
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.download_button("📥 Download Clean Data (CSV)", clean_df.to_csv(index=False), "cleaned_data.csv", "text/csv", use_container_width=True)
-                with c2:
-                    excel_clean = convert_df_to_excel(clean_df)
-                    st.download_button("📥 Download Clean Data (Excel)", excel_clean, "cleaned_data.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-
+  if custom_rules:
+    st.sidebar.success(f"Active rules set for {len(custom_rules)} field(s)!")
 else:
-    st.info("👈 Please connect a database or upload a file from the sidebar to begin inspection.")
+  st.sidebar.info("Upload a dataset to configure matching rules.")
+
+# Main Content Dashboard
+st.title("🔍 TechZita Duplicate Inspector")
+st.subheader("Advanced Multi-Field Duplicate Detection & Graph Clustering Engine")
+st.markdown("---")
+
+if uploaded_file is None and data_source == "CSV / Excel Upload":
+  st.info("👆 Please connect a database or upload a file from the sidebar to begin inspection.")
+else:
+  if df is not None:
+    # Data Preview
+    with st.expander("Preview Raw Dataset", expanded=False):
+      st.dataframe(df.head(10), use_container_width=True)
+
+    # Inspection Configuration Section
+    st.markdown("### 3. Configure Inspection Fields")
+
+    match_mode = st.radio(
+        "Matching Mode",
+        ["Single Column Matching", "Multi-Column Weighted Matching"],
+        horizontal=True,
+    )
+
+    if match_mode == "Single Column Matching":
+      selected_column = st.selectbox(
+          "Select column to evaluate for duplicates", options=all_columns
+      )
+      ui_selected_columns = [selected_column] if selected_column else all_columns[:1]
+    else:
+      ui_selected_columns = st.multiselect(
+          "Select columns to evaluate for duplicates",
+          options=all_columns,
+          default=all_columns[:3] if len(all_columns) >= 3 else all_columns,
+      )
+
+    threshold = st.slider(
+        "Match Similarity Threshold (%)",
+        min_value=50,
+        max_value=100,
+        value=85,
+        step=1,
+    )
+
+    if st.button("Run Duplicate Inspection", type="primary"):
+      # PRIORITY LOGIC: Check Section 2 rules first. If none exist, fallback to Section 3.
+      if custom_rules:
+        active_evaluation_columns = list(custom_rules.keys())
+        evaluation_source = "Section 2 (Custom Matching Rules)"
+      else:
+        active_evaluation_columns = ui_selected_columns
+        evaluation_source = "Section 3 (Configure Inspection Fields)"
+
+      if not active_evaluation_columns:
+        st.warning("Please specify inspection fields via Rules or Configuration.")
+      else:
+        st.success(
+            f"Running duplicate inspection using **{evaluation_source}** "
+            f"across {len(active_evaluation_columns)} field(s)..."
+        )
+
+        # Summary Metrics Dashboard
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Records", len(df))
+        col2.metric("Evaluated Fields", len(active_evaluation_columns))
+        col3.metric("Custom Rules Applied", len(custom_rules))
+        col4.metric("Similarity Cutoff", f"{threshold}%")
+
+        # Display applied evaluation source info
+        st.info(f"Active Evaluation Source: **{evaluation_source}**")
