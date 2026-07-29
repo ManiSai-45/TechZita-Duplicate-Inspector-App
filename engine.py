@@ -1,22 +1,18 @@
-import io
 import pandas as pd
 from rapidfuzz import fuzz
 
 
 def load_matching_rules(uploaded_rule_file):
-  """Parses an external text-based rules file mapping column names to match weights.
+  """Loads custom matching rules from an uploaded text file or file-like object.
 
-  Example format in txt: first_name: 1.0 last_name: 0.8 email: 1.0
+  Format expected: COLUMN_NAME: weight (e.g., CUSTOMER: 1.0)
   """
   rules = {}
-  if uploaded_rule_file is None:
-    return rules
-
   try:
-    if isinstance(uploaded_rule_file, io.IOBase):
-      lines = uploaded_rule_file.readlines()
+    if uploaded_file_has_read_method(uploaded_rule_file):
+      lines = uploaded_rule_file.read().decode("utf-8").splitlines()
     else:
-      lines = uploaded_rule_file.getvalue().decode("utf-8").splitlines()
+      lines = uploaded_rule_file.readlines()
 
     for line in lines:
       if isinstance(line, bytes):
@@ -36,6 +32,10 @@ def load_matching_rules(uploaded_rule_file):
     pass
 
   return rules
+
+
+def uploaded_file_has_read_method(f):
+  return hasattr(f, "read")
 
 
 def calculate_weighted_match_score(row1, row2, selected_columns, rules=None):
